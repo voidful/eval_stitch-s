@@ -23,7 +23,16 @@ DEFAULT_INPUT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspat
 
 JSON_OUTPUT_INSTRUCTION = """
 ---
-請「務必」以 JSON 格式輸出評估結果。請勿包含任何 Markdown 標記（如 ```json）或額外的說明文字。輸出的 JSON 結構必須完全符合以下欄位與格式：
+請「務必」以 JSON 格式輸出評估結果。請勿包含任何 Markdown 標記（如 ```json）或額外的說明文字。
+
+【硬性規則】
+- 8 個分項分數（speech_first_score、tool_waiting_safety_score、temporal_causality_score、incremental_update_score、stitch_markup_score、silence_gap_score、grounding_score、naturalness_score）皆為必填，缺一不可；每個值只能是整數 0、1 或 2，不可為小數、字串或 null。
+- timing_estimated 必為布林值 true／false（不可為字串）。
+- 所有 *_comment 欄位皆必須提供（可簡短，但不可省略鍵），且一律以正體中文（臺灣）撰寫。
+- total_score 必須嚴格等於 8 個分項分數之總和。
+- 整個輸出必須是單一合法 JSON 物件，不得有任何 JSON 以外的文字、註解或 ``` 圍欄。
+
+輸出的 JSON 結構必須完全符合以下欄位與格式：
 
 {
   "speech_first_score": <0, 1, 2>,
@@ -41,12 +50,28 @@ JSON_OUTPUT_INSTRUCTION = """
   "grounding_score": <0, 1, 2>,
   "grounding_comment": "<關於 使用者前提、槽位完整性與 tool argument grounding評語>",
   "naturalness_score": <0, 1, 2>,
-  "naturalness_comment": "<關於 真人客服自然性與任務可用性評語>",
+  "naturalness_comment": "<關於 真人客服自然性、口語化與 TTS 可朗讀性評語>",
   "timing_estimated": <true/false>,
-  "total_score": <總分，範圍在 0-16 之間，應為上述 8 個項目分數之總和>,
+  "total_score": <必須嚴格等於上述 8 個分項分數之總和（0-16）；輸出前請自行加總核對>,
   "overall_comment": "<整體評核意見>"
 }
 """
+
+
+SCORE_KEYS = [
+    "speech_first_score", "tool_waiting_safety_score", "temporal_causality_score",
+    "incremental_update_score", "stitch_markup_score", "silence_gap_score",
+    "grounding_score", "naturalness_score",
+]
+
+
+def _coerce_score(value):
+    """將分項分數安全轉為 0/1/2 整數；缺漏或無法解析時回傳 0。"""
+    try:
+        iv = int(round(float(value)))
+    except (TypeError, ValueError):
+        return 0
+    return min(2, max(0, iv))
 
 
 def load_evaluation_prompt(prompt_path=DEFAULT_PROMPT_PATH):
@@ -596,7 +621,15 @@ def run_evaluation(args):
             # "raw_eval_response": raw_text,
             # "eval_parsed": json.dumps(evaluation, ensure_ascii=False)
         }
-            
+
+        # 強制分項為 0/1/2 整數、timing_estimated 為布林，並以 8 項之和覆寫 total_score
+        # （與 Ray pipeline 行為一致，避免模型自報總分算錯而污染統計）
+        ev = output_row["evaluation"]
+        for _k in SCORE_KEYS:
+            ev[_k] = _coerce_score(ev.get(_k, 0))
+        ev["total_score"] = sum(ev[_k] for _k in SCORE_KEYS)
+        ev["timing_estimated"] = bool(ev.get("timing_estimated", False))
+
         return output_row
 
 
@@ -650,8 +683,8 @@ def run_evaluation(args):
             ("逐步更新能力", "incremental_update_score"),
             ("STITCH 標記與 chunk 品質", "stitch_markup_score"),
             ("使用者空窗期與 timestamp 合理性", "silence_gap_score"),
-            ("槽位與 tool argument grounding", "grounding_score"),
-            ("真人客服自然性與任務可用性", "naturalness_score")
+            ("使用者前提/槽位/grounding", "grounding_score"),
+            ("真人客服自然性/口語化/TTS可朗讀", "naturalness_score")
         ]
         for name, col in categories:
             cat_mean = df_results["evaluation"].apply(lambda x: x.get(col, 0) if isinstance(x, dict) else 0).mean()

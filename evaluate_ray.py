@@ -18,7 +18,16 @@ DEFAULT_INPUT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspat
 
 JSON_OUTPUT_INSTRUCTION = """
 ---
-請「務必」以 JSON 格式輸出評估結果。請勿包含任何 Markdown 標記（如 ```json）或額外的說明文字。輸出的 JSON 結構必須完全符合以下欄位與格式：
+請「務必」以 JSON 格式輸出評估結果。請勿包含任何 Markdown 標記（如 ```json）或額外的說明文字。
+
+【硬性規則】
+- 8 個分項分數（speech_first_score、tool_waiting_safety_score、temporal_causality_score、incremental_update_score、stitch_markup_score、silence_gap_score、grounding_score、naturalness_score）皆為必填，缺一不可；每個值只能是整數 0、1 或 2，不可為小數、字串或 null。
+- timing_estimated 必為布林值 true／false（不可為字串）。
+- 所有 *_comment 欄位皆必須提供（可簡短，但不可省略鍵），且一律以正體中文（臺灣）撰寫。
+- total_score 必須嚴格等於 8 個分項分數之總和。
+- 整個輸出必須是單一合法 JSON 物件，不得有任何 JSON 以外的文字、註解或 ``` 圍欄。
+
+輸出的 JSON 結構必須完全符合以下欄位與格式：
 
 {
   "speech_first_score": <0, 1, 2>,
@@ -36,9 +45,9 @@ JSON_OUTPUT_INSTRUCTION = """
   "grounding_score": <0, 1, 2>,
   "grounding_comment": "<關於 使用者前提、槽位完整性與 tool argument grounding評語>",
   "naturalness_score": <0, 1, 2>,
-  "naturalness_comment": "<關於 真人客服自然性與任務可用性評語>",
+  "naturalness_comment": "<關於 真人客服自然性、口語化與 TTS 可朗讀性評語>",
   "timing_estimated": <true/false>,
-  "total_score": <總分，範圍在 0-16 之間，應為上述 8 個項目分數之總和>,
+  "total_score": <必須嚴格等於上述 8 個分項分數之總和（0-16）；輸出前請自行加總核對>,
   "overall_comment": "<整體評核意見>"
 }
 """
@@ -359,15 +368,34 @@ def clean_and_parse_json(text):
         return {}
 
 
-def process_eval_row(row):
-    raw_response = row.get("raw_response") or ""
-    evaluation = clean_and_parse_json(raw_response)
-    
+SCORE_KEYS = [
+    "speech_first_score", "tool_waiting_safety_score", "temporal_causality_score",
+    "incremental_update_score", "stitch_markup_score", "silence_gap_score",
+    "grounding_score", "naturalness_score",
+]
+
+
+def _coerce_score(value):
+    """將分項分數安全轉為 0/1/2 整數；缺漏或無法解析時回傳 0。"""
+    try:
+        iv = int(round(float(value)))
+    except (TypeError, ValueError):
+        return 0
+    return min(2, max(0, iv))
+
+
+def build_eval_struct(raw_response):
+    """
+    將單筆 LLM 原始回應字串解析為標準化的評分結構 (eval_struct)。
+    為純函式，方便在 driver 端以 pandas apply 使用，避免額外的 Ray shuffle。
+    """
+    evaluation = clean_and_parse_json(raw_response or "")
+
     if isinstance(evaluation, list) and len(evaluation) > 0:
         evaluation = evaluation[0]
     if not isinstance(evaluation, dict):
         evaluation = {}
-        
+
     eval_struct = {
         "speech_first_score": evaluation.get("speech_first_score", 0),
         "speech_first_comment": evaluation.get("speech_first_comment", ""),
@@ -390,24 +418,35 @@ def process_eval_row(row):
         "overall_comment": evaluation.get("overall_comment", ""),
     }
     
-    # 確保總分與分項分數相加一致
-    score_keys = [
-        "speech_first_score",
-        "tool_waiting_safety_score",
-        "temporal_causality_score",
-        "incremental_update_score",
-        "stitch_markup_score",
-        "silence_gap_score",
-        "grounding_score",
-        "naturalness_score"
-    ]
-    inferred_total = sum(int(eval_struct.get(k, 0)) for k in score_keys)
-    if eval_struct["total_score"] == 0 or eval_struct["total_score"] != inferred_total:
-        eval_struct["total_score"] = inferred_total
-        
-    output_row = dict(row)
-    output_row["evaluation"] = eval_struct
-    return output_row
+    # 強制分項為 0/1/2 整數、timing_estimated 為布林，並以 8 項之和覆寫 total_score
+    # （缺鍵或型別錯誤時 _coerce_score 會回 0，避免靜默把整筆總分算錯）
+    for k in SCORE_KEYS:
+        eval_struct[k] = _coerce_score(eval_struct.get(k, 0))
+    eval_struct["total_score"] = sum(eval_struct[k] for k in SCORE_KEYS)
+    eval_struct["timing_estimated"] = bool(eval_struct.get("timing_estimated", False))
+
+    return eval_struct
+
+
+def wait_for_cluster(expected_gpus, timeout=600):
+    """
+    多節點啟動時，worker 節點向 head 註冊需要時間。
+    在送出推論前等待叢集 GPU 數達到預期，避免只用到 head 節點的 GPU。
+    回傳實際偵測到的 GPU 數。
+    """
+    have = int(ray.cluster_resources().get("GPU", 0))
+    if expected_gpus <= 0 or have >= expected_gpus:
+        return have
+
+    waited = 0
+    while waited < timeout:
+        have = int(ray.cluster_resources().get("GPU", 0))
+        if have >= expected_gpus:
+            break
+        print(f"[Cluster] Waiting for workers to join: {have}/{expected_gpus} GPUs ready ...")
+        time.sleep(5)
+        waited += 5
+    return int(ray.cluster_resources().get("GPU", 0))
 
 
 # ==========================================
@@ -470,31 +509,74 @@ def run_evaluation(args):
     df_eval["id"] = ids
 
     # 4. 初始化 Ray
+    #    優先使用環境變數 RAY_ADDRESS (由 SLURM 腳本匯出)，其次 "auto"。
+    #    在多節點 SLURM 作業中若無法連上既有叢集，必須直接報錯，
+    #    否則會悄悄退化成單機 (local) 執行，浪費其餘節點的 GPU。
+    num_nodes = int(os.environ.get("SLURM_JOB_NUM_NODES", "1"))
+    ray_address = os.environ.get("RAY_ADDRESS", "auto")
     try:
-        ray.init(address="auto")
-    except Exception:
-        print("Could not connect to existing Ray cluster. Starting a local Ray instance...")
+        ray.init(address=ray_address)
+    except Exception as e:
+        if num_nodes > 1:
+            raise RuntimeError(
+                f"Multi-node SLURM job ({num_nodes} nodes) but failed to connect to the Ray "
+                f"cluster at address='{ray_address}'. Aborting instead of silently falling back "
+                f"to single-node mode. Original error: {e}"
+            )
+        print("Could not connect to an existing Ray cluster. Starting a local Ray instance...")
         ray.init()
+
+    # 4b. 等待 worker 節點完成註冊，並依「整個叢集」的 GPU 數自動推導 replica 數
+    gpus_per_node = int(os.environ.get("SLURM_GPUS_ON_NODE", "0")) or args.gpus_per_node
+    expected_gpus = num_nodes * gpus_per_node if num_nodes > 1 else 0
+    cluster_gpus = wait_for_cluster(expected_gpus)
+
+    gpus_per_replica = max(1, args.tensor_parallel_size * args.pipeline_parallel_size)
+    if args.concurrency and args.concurrency > 0:
+        num_replicas = args.concurrency
+    else:
+        # 純資料平行：每張 GPU 一個 replica (tp=pp=1)，自動吃滿整個叢集
+        num_replicas = max(1, cluster_gpus // gpus_per_replica)
+
+    print(
+        f"[Cluster] nodes={num_nodes}, total GPUs={cluster_gpus}, "
+        f"GPUs/replica={gpus_per_replica}, vLLM replicas={num_replicas}"
+    )
+    if cluster_gpus < num_replicas * gpus_per_replica:
+        print(
+            f"[Warning] Requested {num_replicas} replicas x {gpus_per_replica} GPU "
+            f"= {num_replicas * gpus_per_replica} GPUs, but only {cluster_gpus} are available. "
+            f"Ray will autoscale up to what fits; check your SLURM allocation."
+        )
 
     # 5. 轉換為 Ray Dataset
     canonical_ds = ray.data.from_pandas(df_eval)
 
     # 6. 配置 vLLM Engine
     print("Configuring vLLM engine processor...")
+    engine_kwargs = {
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "pipeline_parallel_size": args.pipeline_parallel_size,
+        "max_model_len": args.max_model_len,
+        "enable_chunked_prefill": True,
+        # 所有請求共用同一段 system prompt (~3K tokens)，prefix caching 命中率近 100%，是最大的吞吐優化
+        "enable_prefix_caching": True,
+        "kv_cache_dtype": args.kv_cache_dtype,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "max_num_seqs": args.max_num_seqs,
+        "max_num_batched_tokens": args.max_num_batched_tokens,
+        "trust_remote_code": True,
+    }
+    # 單一 replica 需跨節點 (pipeline parallel) 時，必須改用 ray 後端;
+    # 單節點內的 tensor parallel 維持預設的 "mp" 即可，速度較佳。
+    if args.pipeline_parallel_size > 1:
+        engine_kwargs["distributed_executor_backend"] = "ray"
+
     config = vLLMEngineProcessorConfig(
         model_source=args.model,
-        engine_kwargs={
-            "tensor_parallel_size": args.tensor_parallel_size,
-            "max_model_len": args.max_model_len,
-            "enable_chunked_prefill": True,
-            "enable_prefix_caching": True,
-            "kv_cache_dtype": args.kv_cache_dtype,
-            "gpu_memory_utilization": args.gpu_memory_utilization,
-            "max_num_seqs": args.max_num_seqs,
-            "max_num_batched_tokens": args.max_num_batched_tokens,
-            "trust_remote_code": True,
-        },
-        concurrency=(args.concurrency, args.concurrency),
+        engine_kwargs=engine_kwargs,
+        # (n, n) = 固定 n 個 replica，批次作業不需要 autoscaling 的暖機延遲
+        concurrency=(num_replicas, num_replicas),
         batch_size=args.batch_size,
         should_continue_on_error=True,
         max_concurrent_batches=args.max_concurrent_batches,
@@ -511,16 +593,27 @@ def run_evaluation(args):
     print("Running vLLM engine inference for evaluation...")
     start_time = time.time()
     eval_ds = processor(canonical_ds)
-    
-    # Join 回 canonical_ds 以合併欄位
-    print("Joining results and parsing evaluation JSON...")
-    joined_ds = canonical_ds.join(eval_ds, join_type="inner", on=["id"])
-    processed_ds = joined_ds.map(process_eval_row)
-    
-    # 讀取全部結果回記憶體中的 pandas DataFrame
-    results = processed_ds.take_all()
-    df_results = pd.DataFrame(results)
-    
+
+    # 8. 合併結果：vLLM 輸出僅含 id + raw_response，量很小。
+    #    以 pandas 在 driver 端 left-merge 回原始資料，避免 Ray 的分散式 shuffle (join)，
+    #    並用 how="left" 保留推論失敗的列 (raw_response 為空)，不會像 inner join 一樣悄悄遺失資料。
+    print("Collecting inference outputs and merging (no shuffle)...")
+    eval_df = pd.DataFrame(eval_ds.take_all())
+    if eval_df.empty:
+        eval_df = pd.DataFrame(columns=["id", "raw_response"])
+    if "id" not in eval_df.columns:
+        eval_df["id"] = pd.Series(dtype="object")
+    if "raw_response" not in eval_df.columns:
+        eval_df["raw_response"] = ""
+    eval_df = eval_df[["id", "raw_response"]].drop_duplicates(subset=["id"], keep="first")
+
+    df_results = df_eval.merge(eval_df, on="id", how="left")
+    missing = int(df_results["raw_response"].isna().sum())
+    if missing:
+        print(f"[Warning] {missing} row(s) produced no inference output (errors/timeouts). Scored as 0.")
+    df_results["raw_response"] = df_results["raw_response"].fillna("")
+    df_results["evaluation"] = df_results["raw_response"].apply(build_eval_struct)
+
     elapsed_time = time.time() - start_time
     print(f"Evaluation completed in {elapsed_time:.2f} seconds.")
 
@@ -554,8 +647,8 @@ def run_evaluation(args):
             ("逐步更新能力", "incremental_update_score"),
             ("STITCH 標記與 chunk 品質", "stitch_markup_score"),
             ("使用者空窗期與 timestamp 合理性", "silence_gap_score"),
-            ("槽位與 tool argument grounding", "grounding_score"),
-            ("真人客服自然性與任務可用性", "naturalness_score")
+            ("使用者前提/槽位/grounding", "grounding_score"),
+            ("真人客服自然性/口語化/TTS可朗讀", "naturalness_score")
         ]
         for name, col in categories:
             cat_mean = df_results["evaluation"].apply(lambda x: x.get(col, 0) if isinstance(x, dict) else 0).mean()
@@ -630,7 +723,21 @@ if __name__ == "__main__":
         "--tensor-parallel-size",
         type=int,
         default=1,
-        help="Tensor parallel size for vLLM."
+        help="Tensor parallel size (GPUs per replica, within a node). Keep at 1 unless the model "
+             "does not fit on a single GPU."
+    )
+    parser.add_argument(
+        "--pipeline-parallel-size",
+        type=int,
+        default=1,
+        help="Pipeline parallel size (split one replica across nodes). Only needed for models that "
+             "do not fit on a single node; uses distributed_executor_backend='ray'."
+    )
+    parser.add_argument(
+        "--gpus-per-node",
+        type=int,
+        default=8,
+        help="GPUs per node, used to compute expected cluster size when SLURM_GPUS_ON_NODE is unset."
     )
     parser.add_argument(
         "--gpu-memory-utilization",
@@ -641,8 +748,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--concurrency",
         type=int,
-        default=8,
-        help="Number of concurrent vLLM actors (engine instances)."
+        default=0,
+        help="Number of concurrent vLLM replicas. 0 (default) = auto: total cluster GPUs / "
+             "(tensor_parallel_size * pipeline_parallel_size), so it fills every node automatically."
     )
     parser.add_argument(
         "--batch-size",
