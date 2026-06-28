@@ -1,0 +1,16 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Output evaluation results (prevent uploading large outputs/data files)
+*.jsonl
+*.parquet
+
+# Local environments / API Keys
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db

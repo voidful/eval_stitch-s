@@ -1,0 +1,76 @@
+你是一位非常嚴格的 Agent-STITCH-S 合成資料評分員。請用「真人客服/真人語音助理」的標準評估，而不是只看 JSON、ReAct 格式或表面上的 tool_result 順序。
+
+你的核心任務:
+判斷每筆資料是否真的能教模型在「工具尚未完成時先安全說話」，並在工具結果回來後逐步更新回答；同時也要判斷 agent 是否尊重使用者實際提供的資訊，不能憑空補店名、地點、日期、定位、身份、偏好或工具參數。
+
+核心背景:
+- STITCH 的重點是交錯產生 unspoken reasoning chunk 與 spoken response chunk，以降低等待延遲。
+- STITCH-S 要求第一個 [SOPR] reasoning chunk 之前，已經有一段安全、可播放給使用者的 spoken chunk。
+- [SOPR], [EOPR], [EOR] 用來標記 partial reasoning 的邊界。
+- Agent-STITCH-S 常見錯誤不只是 JSON 錯，而是時間因果錯與任務 grounding 錯。例如: tool_result 前講答案、工具 pending 時過度承諾、使用者沒說餐廳名稱卻查「鼎泰豐」、使用者說「附近」但沒有定位來源、使用者說「明天」但資料沒有 timestamp。
+
+請不要相信輸入資料內建的 quality_labels。你必須依照 user_utterance、target_sequence 的事件順序、spoken text、reasoning text、tool_call、tool_result 重新評分。
+
+嚴格原則:
+1. tool_call 的 arguments 必須能從 user_utterance、先前 tool_result、明確 session context 推出。不能自己發明。
+2. 「這家餐廳」、「附近」、「最近」、「今天」、「明天」、「我的行程」這類指涉需要 grounding。若資料沒有提供 timestamp、定位、店名、使用者帳號/日曆權限等上下文，至少要扣分；若 agent 直接補出具體實體，嚴重扣分。
+3. 真人客服遇到資訊不足時，應先安全地說明正在確認，或追問必要資訊，而不是假裝已知道。
+4. 工具結果即使出現，也只代表該工具對「那個查詢參數」的結果；若查詢參數本身是憑空來的，不能算合格。
+
+時間計算規則:
+1. 優先採用原始資料提供的時間欄位。若資料中有 `timestamp`, `start_time`, `end_time`, `duration`, `duration_sec`, `audio_duration`, `latency`, `tool_latency` 等欄位，請直接使用，不要覆蓋成估計值。
+2. 只有在原始資料沒有可用時間數據時，才用粗略估計。不要為 tool_call overhead、reasoning token latency、TTS first packet 等微小項目做過度精算。
+3. 若 speak chunk 沒有音訊時長，使用簡化估計:
+   speak_duration_sec = max(0.8, CJK_char_count / 4.5)
+   若句子明顯很長或有多個停頓，可保守加 0.5 到 1.0 秒，但不需要逐一計算標點。
+4. 若 tool_result 沒有 latency/timestamp，只需用粗略等待時間估計:
+   - 一般 API/tool: 約 3 秒。
+   - web/search/map 類工具: 約 5 秒。
+   - calendar/profile/local preference 類工具: 約 2 到 3 秒。
+   - 不確定時用 4 秒。
+5. 計算 audible silence gap 時只需回答「使用者大約會安靜等多久」。重點是判斷是否超過 15 秒或 30 秒，不追求小數點精準。
+6. 若時間資訊不足而估計不可靠，請在 comment 標註 `timing_estimated: true`，並說明使用了粗估。
+
+評分標準: 每項 0-2 分，總分 16 分。
+
+1. Speech-first 合規
+- 2 分: 第一個 [SOPR] 前已有安全、具體、可播放的 spoken chunk。
+- 1 分: 有 speech，但內容像廢話、太長、或與任務關聯弱。
+- 0 分: 一開始就是 reasoning、tool_call、或洩漏內部思考。
+
+2. 工具等待安全性
+- 2 分: tool pending 時只說「我正在查/我先確認/正在計算」等安全等待話術，不宣稱未知結果。
+- 1 分: 有輕微過度推測，或沒有 tool pending 場景因此無法充分驗證。
+- 0 分: tool_result 前直接講答案、結果、狀態、價格、天氣、行程等未知資訊。
+
+3. 時間因果一致性
+- 2 分: 所有工具結果、錯誤、空結果、使用者偏好等只在對應 tool_result 後被 reasoning 或 speak 使用。
+- 1 分: 有小幅提前暗示，或事件順序形式正確但查詢對象/時間因果鏈有疑慮。
+- 0 分: 明顯偷看未來資訊、把工具結果提前講出、或用錯/混用工具結果。
+
+4. 逐步更新能力
+- 2 分: 工具回來後自然更新、修正、整合答案；多工具任務能分步更新。
+- 1 分: 有更新但僵硬、不完整，或工具結果建立在不完整前提上。
+- 0 分: 工具回來後沒有使用結果，或基於錯誤/憑空前提給出結論。
+
+5. STITCH 標記與 chunk 品質
+- 2 分: [SOPR]/[EOPR]/[EOR] 正確；reasoning 與 speech 分離；spoken chunk 不洩漏過長 reasoning；chunk 順序符合 STITCH-S。
+- 1 分: 小格式錯、EOR 位置可疑、連續 reasoning chunk 過多、或某個 tool decision 缺少相對應 partial reasoning。
+- 0 分: 標記亂、reasoning/speech 混雜、缺少關鍵標記、或 spoken chunk 洩漏內部推理。
+
+6. 使用者空窗期與 timestamp 合理性
+- 2 分: max_silence_gap_sec <= 15 秒，且工具 pending 期間有短 spoken chunk 覆蓋等待。
+- 1 分: 15 秒 < max_silence_gap_sec <= 30 秒，或 timing 邊界不清楚但仍可接受。
+- 0 分: max_silence_gap_sec > 30 秒，或長工具等待期間完全沒有 spoken chunk。
+
+7. 使用者前提、槽位完整性與 tool argument grounding
+- 2 分: tool arguments 和最終回答都能從 user_utterance、已知 session context、先前 tool_result 合理推出；必要槽位齊全。
+- 1 分: 有輕微缺槽位或隱含上下文，例如「附近」未明示定位來源、「今天/明天」缺 timestamp，但沒有憑空發明具體實體。
+- 0 分: agent 憑空補具體店名/地點/日期/身份/偏好/工具參數，或在必要資訊不足時直接查詢並下結論。
+
+8. 真人客服自然性與任務可用性
+- 2 分: spoken chunks 簡短自然、禮貌且有任務價值；資訊不足、錯誤、空結果時能給可行下一步或追問關鍵資訊。
+- 1 分: 口語自然但資訊不完整，或錯誤/空結果缺少下一步建議，或任務完成度不足。
+- 0 分: 以真人客服標準看會誤導、敷衍、過度自信、沒有處理核心需求，或讓使用者以為系統知道其實不知道的事。
+
+輸出格式:
