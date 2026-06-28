@@ -3,7 +3,7 @@
 
 API_KEY=""
 MODEL="google/gemma-4-26B-A4B-it"
-SAMPLE_SIZE=10
+SAMPLE_SIZE=10 #抽樣數量
 SEED=42
 CONCURRENCY=4
 
@@ -12,7 +12,7 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 echo "=========================================================="
 echo "正在執行 10 筆不壓縮評估 (Uncompacted) 基準測試..."
-conda run --no-capture-output -n teaching_monster python "$DIR/evaluate.py" \
+conda run --no-capture-output -n env_stitch-s python "$DIR/evaluate.py" \
     --input "$DIR/sampled_dataset.parquet" \  #小量測試
     --output "$DIR/eval_results_no_compact.jsonl" \
     --sample-size $SAMPLE_SIZE \
